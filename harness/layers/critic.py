@@ -79,16 +79,81 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        observed = ctx.observed_text or ""
+        new_claims = []
+        abstained = report.get("abstain", False)
+
+        def _find_doc_for_text(text: str):
+            if ctx.corpus is None or not text:
+                return None
+            for d in ctx.corpus.docs:
+                if any(text in line for line in d.body.splitlines()):
+                    if d.body in observed:
+                        return d
+            # Thử nới lỏng nếu doc không nằm trọn vẹn trong observed nhưng từng dòng thì có
+            for d in ctx.corpus.docs:
+                if any(text in line for line in d.body.splitlines()):
+                    return d
+            return None
+
+        def _try_split(t):
+            for d in (" và và ", " và "):
+                if d in t:
+                    parts = t.split(d)
+                    for i in range(1, len(parts)):
+                        h = d.join(parts[:i]).strip()
+                        tail = d.join(parts[i:]).strip()
+                        if h in observed and tail in observed:
+                            return h, tail
+            return None
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text:
+                continue
+            if text in observed:
+                new_claims.append(claim)
+                continue
+
+            split_res = _try_split(text)
+            if split_res:
+                head, tail = split_res
+                doc0 = _find_doc_for_text(head)
+                doc1 = _find_doc_for_text(tail)
+                if doc0 and doc1 and doc0.doc_id != doc1.doc_id:
+                    new_claims.append({"text": head, "doc_id": doc0.doc_id})
+                    new_claims.append({"text": tail, "doc_id": doc1.doc_id})
+                    abstained = True
+                    continue
+
+        if not new_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để kết luận do tài liệu không có thông tin hoặc mâu thuẫn."
+            return report
+
+        # Loại bỏ các claim trùng lặp chữ hoàn toàn (tránh bị phạt REDUNDANT/KHÔNG LIÊN QUAN)
+        seen_texts = set()
+        deduped = []
+        for c in new_claims:
+            t = c.get("text", "")
+            if t not in seen_texts:
+                seen_texts.add(t)
+                deduped.append(c)
+        new_claims = deduped
+
+        if abstained:
+            report["abstain"] = True
+
+        report["claims"] = new_claims
+        report["citations"] = sorted({c["doc_id"] for c in new_claims if c.get("doc_id")})
+        return report
